@@ -497,6 +497,91 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 	}
 }
 
+interface NeuralwattModel {
+	id: string;
+	max_model_len?: number;
+	metadata?: {
+		display_name?: string;
+		pricing?: {
+			input_per_million?: number;
+			output_per_million?: number;
+			cached_input_per_million?: number;
+		};
+		capabilities?: {
+			tools?: boolean;
+			vision?: boolean;
+			reasoning?: boolean;
+			reasoning_effort?: boolean;
+			developer_role?: boolean;
+		};
+		limits?: {
+			max_context_length?: number;
+			max_output_tokens?: number;
+		};
+	};
+}
+
+async function fetchNeuralwattModels(): Promise<Model<any>[]> {
+	try {
+		console.log("Fetching models from Neuralwatt API...");
+		const response = await fetch("https://api.neuralwatt.com/v1/models");
+		const data = await response.json();
+
+		const items = Array.isArray(data.data) ? (data.data as NeuralwattModel[]) : [];
+		const models: Model<any>[] = [];
+		for (const model of items) {
+			const capabilities = model.metadata?.capabilities;
+			// Only include models that support tools
+			if (capabilities?.tools !== true) continue;
+
+			const input: ("text" | "image")[] = ["text"];
+			if (capabilities?.vision) {
+				input.push("image");
+			}
+
+			const pricing = model.metadata?.pricing;
+			const contextWindow = model.metadata?.limits?.max_context_length ?? model.max_model_len ?? 4096;
+			const maxOutput = model.metadata?.limits?.max_output_tokens;
+
+			// Neuralwatt exposes per-model capabilities. Models that reason but reject
+			// the reasoning_effort parameter (e.g. qwen3.6-35b, kimi variants) must opt
+			// out so the provider never sends it. None of the current models support
+			// the OpenAI `developer` role (developer_role: false), so route system
+			// prompts via the `system` role instead.
+			const supportsReasoningEffort = capabilities?.reasoning_effort === true;
+			const supportsDeveloperRole = capabilities?.developer_role === true;
+			const compat: OpenAICompletionsCompat = {};
+			if (!supportsReasoningEffort) compat.supportsReasoningEffort = false;
+			if (!supportsDeveloperRole) compat.supportsDeveloperRole = false;
+
+			models.push({
+				id: model.id,
+				name: model.metadata?.display_name || model.id,
+				api: "openai-completions",
+				provider: "neuralwatt",
+				baseUrl: "https://api.neuralwatt.com/v1",
+				reasoning: capabilities?.reasoning === true,
+				input,
+				cost: {
+					input: roundCost(pricing?.input_per_million ?? 0),
+					output: roundCost(pricing?.output_per_million ?? 0),
+					cacheRead: roundCost(pricing?.cached_input_per_million ?? 0),
+					cacheWrite: 0,
+				},
+				contextWindow,
+				maxTokens: maxOutput ?? contextWindow,
+				compat,
+			});
+		}
+
+		console.log(`Fetched ${models.length} tool-capable models from Neuralwatt`);
+		return models;
+	} catch (error) {
+		console.error("Failed to fetch Neuralwatt models:", error);
+		return [];
+	}
+}
+
 async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from Vercel AI Gateway API...");
@@ -1438,9 +1523,15 @@ async function generateModels() {
 	const modelsDevModels = await loadModelsDevData();
 	const openRouterModels = await fetchOpenRouterModels();
 	const aiGatewayModels = await fetchAiGatewayModels();
+	const neuralwattModels = await fetchNeuralwattModels();
 
 	// Combine models (models.dev has priority)
-	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
+	const allModels = [
+		...modelsDevModels,
+		...openRouterModels,
+		...aiGatewayModels,
+		...neuralwattModels,
+	].filter(
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);
